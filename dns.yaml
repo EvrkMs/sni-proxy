@@ -1,0 +1,10 @@
+dns:
+  endpoints:
+    # DoH
+    - https://dns.google/dns-query
+    - https://cloudflare-dns.com/dns-query
+    - https://dns.quad9.net/dns-query
+    # DoT (резервки)
+    - tls://1.1.1.1        # Cloudflare
+    - tls://9.9.9.9:853    # Quad9
+    - tls://8.8.8.8

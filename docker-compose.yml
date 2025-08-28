@@ -1,0 +1,23 @@
+services:
+  sni-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sni-proxy
+    restart: always
+    ports:
+      - "443:443"     # если нужен входящий TLS-трафик
+      - "80:443"       # если нужен обычный HTTP
+      - "8081:8081"
+      - "5001:8080"
+      - "8080:443"
+    environment:
+      - LOG_LEVEL=info    # если ты используешь переменные окружения
+    volumes:
+      - ./dns.yaml:/dns.yaml
+    networks:
+      - proxy-net
+
+networks:
+  proxy-net:
+    driver: bridge

@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SNI Proxy Logs</title>
+    <style>
+        body { font-family: monospace; margin: 20px; }
+        .log { margin: 0; }
+        .tcp { color: blue; }
+        .udp-quic { color: green; }
+        .udp-dtls { color: darkorange; }
+        .info { color: black; }
+        .debug { color: gray; }
+        .warn { color: orange; }
+        .error { color: red; }
+        .controls { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h1>SNI Proxy Logs</h1>
+    <div class="controls">
+        <label><input type="checkbox" id="showTCP" checked> Show TCP</label>
+        <label><input type="checkbox" id="showUDP" checked> Show UDP</label>
+        <label style="margin-left: 20px;">
+            <input type="checkbox" id="showQUIC" checked> Show QUIC (UDP)
+        </label>
+        <label>
+            <input type="checkbox" id="showDTLS" checked> Show DTLS (UDP)
+        </label>
+        <br>
+        <label><input type="checkbox" id="levelInfo" checked> Info</label>
+        <label><input type="checkbox" id="levelDebug" checked> Debug</label>
+        <label><input type="checkbox" id="levelWarn" checked> Warn</label>
+        <label><input type="checkbox" id="levelError" checked> Error</label>
+    </div>
+    <pre id="logs"></pre>
+    <script>
+        const ws = new WebSocket("ws://localhost:8081/ws");
+        const logsElem = document.getElementById("logs");
+        const showTCP    = document.getElementById("showTCP");
+        const showUDP    = document.getElementById("showUDP");
+        const showQUIC   = document.getElementById("showQUIC");
+        const showDTLS   = document.getElementById("showDTLS");
+        const levelInfo  = document.getElementById("levelInfo");
+        const levelDebug = document.getElementById("levelDebug");
+        const levelWarn  = document.getElementById("levelWarn");
+        const levelError = document.getElementById("levelError");
+        let logs = []; // store all log entries
+
+        ws.onmessage = function(event) {
+            let obj;
+            try { obj = JSON.parse(event.data); } catch (_) { return; }
+            const level = obj.level || 'info';
+            const msg   = obj.msg || '';
+            let text = '[' + new Date(obj.ts * 1000).toLocaleTimeString() + '] ' + msg;
+            if (obj.error) text += ' ' + obj.error;
+
+            let logType = 'udp-quic';
+            if (msg.includes('[TCP]')) {
+                logType = 'tcp';
+            } else if (msg.includes('DTLS')) {
+                logType = 'udp-dtls';
+            } else if (msg.includes('[UDP]')) {
+                logType = 'udp-quic';
+            }
+
+            logs.push({ text: text, type: logType, level: level });
+            if (logs.length > 1000) logs.shift();
+            renderLogs();
+        };
+
+        function renderLogs() {
+            logsElem.innerHTML = '';
+            logs.forEach(entry => {
+                const { text, type, level } = entry;
+
+                if (!levelInfo.checked && level === 'info') return;
+                if (!levelDebug.checked && level === 'debug') return;
+                if (!levelWarn.checked && level === 'warn') return;
+                if (!levelError.checked && level === 'error') return;
+
+                if (type === 'tcp' && showTCP.checked) {
+                    appendLog(text, `tcp ${level}`);
+                }
+                if (type === 'udp-quic' && showUDP.checked && showQUIC.checked) {
+                    appendLog(text, `udp-quic ${level}`);
+                }
+                if (type === 'udp-dtls' && showUDP.checked && showDTLS.checked) {
+                    appendLog(text, `udp-dtls ${level}`);
+                }
+            });
+            logsElem.scrollTop = logsElem.scrollHeight;
+        }
+
+        function appendLog(text, cls) {
+            const p = document.createElement("p");
+            p.className = `log ${cls}`;
+            p.textContent = text;
+            logsElem.appendChild(p);
+        }
+
+        showTCP.addEventListener('change', renderLogs);
+        showUDP.addEventListener('change', renderLogs);
+        showQUIC.addEventListener('change', renderLogs);
+        showDTLS.addEventListener('change', renderLogs);
+        levelInfo.addEventListener('change', renderLogs);
+        levelDebug.addEventListener('change', renderLogs);
+        levelWarn.addEventListener('change', renderLogs);
+        levelError.addEventListener('change', renderLogs);
+    </script>
+</body>
+</html>
