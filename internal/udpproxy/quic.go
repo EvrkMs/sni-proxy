@@ -169,19 +169,10 @@ func (p *Proxy) sniffInitial(dcidHex string, addr *net.UDPAddr, data []byte) {
 	p.log.Debug("[sniffInitial] trying extractSNIFromQUICInitial", zap.String("dcid", dcidHex), zap.Int("full_len", len(full)))
 
 	if sni, alpn, err := extractSNIFromQUICInitial(full, p.log); err == nil {
-		if v, ok := p.clients.Load(dcidHex); ok {
-			info := v.(*clientInfo)
-			info.domain = sni
-			info.alpn = alpn
-			p.clients.Store(dcidHex, info)
-		} else {
-			p.clients.Store(dcidHex, &clientInfo{
-				addr:     addr,
-				domain:   sni,
-				alpn:     alpn,
-				lastSeen: time.Now(),
-			})
-		}
+		// ✅ Правка: работаем с нашим реестром клиентов (value-ориентированным)
+		p.clients.upsert(addr, sni, alpn)
+		p.clients.linkConnID(dcidHex, addr)
+
 		p.log.Info("[sniffInitial] SNI/ALPN extracted", zap.String("dcid", dcidHex), zap.String("sni", sni), zap.String("alpn", alpn))
 		delete(p.unknown, dcidHex)
 	} else {

@@ -3,20 +3,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        BUILD_TARGET: .            # или ./cmd/sni-proxy
     container_name: sni-proxy
     restart: always
     ports:
-      - "443:443"     # если нужен входящий TLS-трафик
-      - "80:443"       # если нужен обычный HTTP
-      - "8081:8081"
-      - "5001:8080"
+      - "443:443"
+      - "80:443"
       - "8080:443"
     environment:
-      - LOG_LEVEL=info    # если ты используешь переменные окружения
+      - LOG_LEVEL=info
+      # Если это Go-приложение: задаём предел для кучи GC (Go 1.19+ понимает GOMEMLIMIT)
+      - GOMEMLIMIT=380MiB
+      # Можно оставить по умолчанию, если не Go — просто не подействует.
     volumes:
-      - ./dns.yaml:/dns.yaml
+      - ./dns.yaml:/dns.yaml:ro
     networks:
       - proxy-net
+
+    # --- жёсткие и мягкие лимиты памяти ---
+    mem_reservation: 128m    # «мягкий» предел — намёк Docker-у
+    mem_limit: 512m          # «жёсткий» предел — выше нельзя
 
 networks:
   proxy-net:

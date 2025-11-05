@@ -11,35 +11,15 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	io_prometheus_client "github.com/prometheus/client_model/go" // dto
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"go.uber.org/zap"
 
 	dns "sni_proxy/dns"
 	tcpproxy "sni_proxy/internal/tcpproxy"
 	udpproxy "sni_proxy/internal/udpproxy"
-	ws "sni_proxy/internal/websocket"
 )
 
-// Глобальные метрики Prometheus
-var (
-	DnsRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "dns_requests_total",
-		Help: "Total number of DNS requests",
-	}, []string{"domain", "status"})
-	TcpActiveConnections = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "tcp_active_connections",
-		Help: "Current number of active TCP connections",
-	})
-	UdpActiveConnections = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "udp_active_connections",
-		Help: "Current number of active UDP connections",
-	})
-	UdpPacketErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "udp_packet_errors_total",
-		Help: "Total number of UDP packet errors",
-	}, []string{"type"})
-	logger *zap.Logger
-)
+var logger *zap.Logger
 
 func init() {
 	var err error
@@ -47,52 +27,25 @@ func init() {
 	if err != nil {
 		panic("failed to initialize logger: " + err.Error())
 	}
-
-	// Безопасная регистрация: проверяет, не зарегистрирована ли уже
-	registerOnce(DnsRequests)
-	registerOnce(TcpActiveConnections)
-	registerOnce(UdpActiveConnections)
-	registerOnce(UdpPacketErrors)
 }
 
-func registerOnce(c prometheus.Collector) {
-	if err := prometheus.DefaultRegisterer.Register(c); err != nil {
-		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
-			// Подменяем на уже зарегистрированную метрику
-			_ = are.ExistingCollector
-		} else {
-			panic(err)
-		}
-	}
-}
-
-// getGaugeValue получает текущее значение метрики Gauge
-func getGaugeValue(g prometheus.Gauge) float64 {
-	ch := make(chan prometheus.Metric, 1)
-	g.Collect(ch)
-	metric := <-ch
-	pb := &io_prometheus_client.Metric{}
-	if err := metric.Write(pb); err != nil {
-		return -1 // ошибка при сериализации
-	}
-	if pb.Gauge != nil && pb.Gauge.Value != nil {
-		return *pb.Gauge.Value
-	}
-	return -1 // значение не найдено
+// В твоей версии testutil.ToFloat64 возвращает только float64.
+func gaugeValue(c prometheus.Collector) float64 {
+	return testutil.ToFloat64(c)
 }
 
 func main() {
 	// ─── Параметры командной строки ────────────────────────────────────────────
-	addr         := flag.String("addr", ":443", "TCP and UDP proxy listen address")
-	globalLimit  := flag.Int("global-limit", 8000, "Global connection limit")
-	perIPLimit   := flag.Int("per-ip-limit", 80, "Per-IP connection limit")
+	addr := flag.String("addr", ":443", "TCP and UDP proxy listen address")
+	globalLimit := flag.Int("global-limit", 8000, "Global connection limit")
+	perIPLimit := flag.Int("per-ip-limit", 80, "Per-IP connection limit")
 	flag.Parse()
 
-	// ─── Контекст для graceful‑shutdown ────────────────────────────────────────
+	// ─── Контекст для graceful-shutdown ────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ─── DNS‑резолвер ──────────────────────────────────────────────────────────
+	// ─── DNS-резолвер ──────────────────────────────────────────────────────────
 	resolver := dns.NewResolver(dns.Config{
 		DOHURLs:              []string{"https://cloudflare-dns.com/dns-query", "https://dns.google/dns-query"},
 		LookupTimeout:        4 * time.Second,
@@ -104,31 +57,28 @@ func main() {
 		InitialBackoff:       500 * time.Millisecond,
 	})
 
-	// ─── TCP‑прокси ────────────────────────────────────────────────────────────
+	// ─── TCP-прокси ────────────────────────────────────────────────────────────
 	tcpProxy := tcpproxy.NewTCPProxy(resolver, *addr, logger, *globalLimit, *perIPLimit, 5*time.Minute)
 
-	// ─── UDP‑прокси (внутри сразу открывает udp4+udp6 сокеты) ─────────────────
+	// ─── UDP-прокси ────────────────────────────────────────────────────────────
 	udpProxy, err := udpproxy.NewProxy(*addr, resolver, logger, udpproxy.DefaultConfig())
 	if err != nil {
 		logger.Fatal("[UDP] proxy initialization error", zap.Error(err))
 	}
 
-	// ─── HTTP‑сервер для метрик ────────────────────────────────────────────────
+	// ─── HTTP-сервер для метрик ────────────────────────────────────────────────
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	httpServer := &http.Server{Handler: mux}
 
-	// ─── WebSocket‑сервер (дэшборд/отладка) ────────────────────────────────────
-	wsServer := ws.NewWebSocketServer(logger)
-
-	// ─── Запуск всех слушателей ────────────────────────────────────────────────
+	// ─── Запуск слушателей ────────────────────────────────────────────────────
 	tcpLn, err := net.Listen("tcp", *addr)
 	if err != nil {
 		logger.Fatal("[TCP] listen error", zap.Error(err))
 	}
 	go tcpProxy.ListenWithListener(ctx, tcpLn)
 
-	go udpProxy.Listen() // ← запускаем приём пакетов на уже открытых UDP‑сокетах
+	go udpProxy.Listen()
 
 	httpLn, err := net.Listen("tcp", ":8080")
 	if err != nil {
@@ -140,13 +90,7 @@ func main() {
 		}
 	}()
 
-	wsLn, err := net.Listen("tcp", ":8081")
-	if err != nil {
-		logger.Fatal("[WS] listen error", zap.Error(err))
-	}
-	go wsServer.Start(ctx, wsLn)
-
-	// ─── Ожидание Ctrl‑C / SIGINT ──────────────────────────────────────────────
+	// ─── Ожидание SIGINT ──────────────────────────────────────────────────────
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	<-sig
@@ -156,22 +100,19 @@ func main() {
 
 	// ─── Логируем метрики перед выходом ───────────────────────────────────────
 	logger.Info("active connections",
-		zap.Float64("tcp", getGaugeValue(TcpActiveConnections)),
-		zap.Float64("udp", getGaugeValue(UdpActiveConnections)),
+		zap.Float64("tcp", gaugeValue(tcpproxy.TCPActiveConnections)),
+		zap.Float64("udp", gaugeValue(udpproxy.UDPActiveConnections)),
 	)
 
-	// ─── Закрываем TCP/HTTP/WS (UDP‑сокеты закроются внутри udpProxy) ─────────
+	// ─── Закрытие слушателей ──────────────────────────────────────────────────
 	if err := tcpLn.Close(); err != nil {
 		logger.Error("[TCP] close error", zap.Error(err))
 	}
 	if err := httpLn.Close(); err != nil {
 		logger.Error("[HTTP] close error", zap.Error(err))
 	}
-	if err := wsLn.Close(); err != nil {
-		logger.Error("[WS] close error", zap.Error(err))
-	}
 
-	// ─── Корректное завершение HTTP‑серверов ──────────────────────────────────
+	// ─── Корректное завершение HTTP-сервера ───────────────────────────────────
 	shutdownCtx, stop := context.WithTimeout(context.Background(), 5*time.Second)
 	defer stop()
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
@@ -179,5 +120,5 @@ func main() {
 	}
 
 	logger.Info("shutdown complete")
-	time.Sleep(1 * time.Second) // небольшой буфер, чтобы логи успели записаться
+	time.Sleep(1 * time.Second)
 }

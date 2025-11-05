@@ -123,12 +123,9 @@ func (p *Proxy) feedDTLS(addr *net.UDPAddr, rec []byte) (string, bool) {
 		p.log.Debug("[UDP] DTLS SNI extraction failed", zap.String("cli", addr.String()), zap.Error(err))
 		return "", false
 	}
-	p.clients.Store(addr.String(), &clientInfo{
-		addr:     addr,
-		domain:   sni,
-		alpn:     alpn,
-		lastSeen: time.Now(),
-	})
+
+	// ✅ Правка: используем наш реестр
+	p.clients.upsert(addr, sni, alpn)
 	return sni, true
 }
 

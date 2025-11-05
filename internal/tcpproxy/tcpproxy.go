@@ -20,8 +20,9 @@ import (
 
 // Метрики Prometheus
 var (
-	activeConnections = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "active_connections",
+	// Экспортируем, чтобы main мог читать текущее значение
+	TCPActiveConnections = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "tcp_active_connections",
 		Help: "Current number of active TCP connections",
 	})
 	dnsRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -31,7 +32,7 @@ var (
 )
 
 func init() {
-	prometheus.MustRegister(activeConnections, dnsRequests)
+	prometheus.MustRegister(TCPActiveConnections, dnsRequests)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -96,7 +97,7 @@ func (p *TCPProxy) accept(cli net.Conn) {
 	case p.globalSem <- struct{}{}:
 	default:
 		p.log.Warn("[TCP] global-limit drop", zap.String("client", cli.RemoteAddr().String()))
-		cli.Close()
+		_ = cli.Close()
 		return
 	}
 	defer func() { <-p.globalSem }()
@@ -108,7 +109,7 @@ func (p *TCPProxy) accept(cli net.Conn) {
 	case ipCh <- struct{}{}:
 	default:
 		p.log.Warn("[TCP] per-IP limit", zap.String("ip", ip))
-		cli.Close()
+		_ = cli.Close()
 		return
 	}
 	defer func() { <-ipCh }()
@@ -116,7 +117,7 @@ func (p *TCPProxy) accept(cli net.Conn) {
 	p.cleanupOnce.Do(p.gcIPSem)
 
 	if err := p.limiter.Wait(context.Background()); err != nil {
-		cli.Close()
+		_ = cli.Close()
 		return
 	}
 
@@ -128,8 +129,8 @@ func (p *TCPProxy) accept(cli net.Conn) {
 /* -------------------------------------------------------------------------- */
 
 func (p *TCPProxy) session(cli net.Conn) {
-	activeConnections.Inc()
-	defer activeConnections.Dec()
+	TCPActiveConnections.Inc()
+	defer TCPActiveConnections.Dec()
 
 	id := cli.RemoteAddr().String()
 	defer cli.Close()
@@ -289,7 +290,7 @@ func (p *TCPProxy) session(cli net.Conn) {
 			return
 		}
 
-		// Читаем HTTP-ответ (status 101 Switching Protocols для WebSocket или обычный HTTP-ответ)
+		// Читаем HTTP-ответ
 		upR := bufio.NewReader(up)
 		respHeaders, err := readHTTPHeaders(upR)
 		if err != nil {
@@ -298,7 +299,7 @@ func (p *TCPProxy) session(cli net.Conn) {
 			return
 		}
 
-		// Отдаём клиенту HTTP-ответ (он может быть 101 Switching Protocols → тогда WS хендшейк)
+		// Отдаём клиенту HTTP-ответ (может быть 101 Switching Protocols)
 		for _, line := range respHeaders {
 			if _, err := cli.Write([]byte(line + "\r\n")); err != nil {
 				p.log.Debug("[TCP] write HTTP response fail", zap.String("client", id), zap.Error(err))
@@ -318,20 +319,14 @@ func (p *TCPProxy) session(cli net.Conn) {
 	}
 
 	// --- Теперь bidirectional data copy (TCP<->upstream)
-	//
-	// Если это WebSocket (ws:// или wss://), то нужно держать соединение максимально долго:
-	// просто не ставить deadline, чтобы прокси не обрывал “из-за таймаута”.
-	//
 	resetDeadline := func() {
 		if isWebSocket {
-			// Для ws:// и wss:// deadline не ставим вообще (0 = без таймаута)
 			_ = cli.SetDeadline(time.Time{})
 			_ = up.SetDeadline(time.Time{})
 			return
 		}
-		// Старая логика: по обычным HTTPS-запросам ставим keep-alive таймаут
 		if strings.HasSuffix(sni, ".discord.media") {
-			return // пропускаем deadline для discord.media
+			return
 		}
 		d := time.Now().Add(p.keepAlive)
 		_ = cli.SetDeadline(d)
@@ -344,9 +339,7 @@ func (p *TCPProxy) session(cli net.Conn) {
 
 	cp := func(dst net.Conn, src net.Conn, wg *sync.WaitGroup) {
 		defer wg.Done()
-		defer func() {
-			setReason("client_disconnect")
-		}()
+		defer func() { setReason("client_disconnect") }()
 		buf := bufPool.Get().([]byte)
 		defer bufPool.Put(buf)
 

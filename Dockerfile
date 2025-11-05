@@ -1,27 +1,30 @@
-# Этап 1: Сборка бинарника
+# Этап 1: build
 FROM golang:1.24.3 AS builder
-
-# Создаем рабочую директорию
 WORKDIR /app
 
-# Копируем go.mod и go.sum (для кеширования зависимостей)
+# Если используешь go.work — раскомментируй следующую строку
+# COPY go.work ./
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Копируем остальной исходный код
+# Копируем исходники
 COPY . .
 
-# Сборка бинарника
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o app
+# Приводим зависимости в порядок (добавит/удалит записи в go.mod/go.sum)
+RUN go mod tidy
 
-# Этап 2: Минимальный runtime-образ
+# Если main в корне:
+#   BUILD_TARGET="."
+# Если main в подкаталоге (например cmd/sni-proxy):
+#   BUILD_TARGET="./cmd/sni-proxy"
+ARG BUILD_TARGET=.
+
+# Собираем статический бинарник
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -trimpath -ldflags "-s -w" -o app ${BUILD_TARGET}
+
+# Этап 2: minimal runtime
 FROM gcr.io/distroless/static:nonroot
-
-# Копируем бинарник из предыдущего этапа
-COPY --from=builder /app/app /
-
-# Указываем, какой пользователь будет запускать (non-root)
-USER root:root
-
-# Точка входа
+COPY --from=builder /app/app /app
+USER nonroot:nonroot
 ENTRYPOINT ["/app"]
