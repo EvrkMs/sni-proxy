@@ -25,23 +25,19 @@ func TestForwarding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	proxy.clients.Store("aa", &clientInfo{
-		addr:     &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
-		domain:   "test",
-		alpn:     "",
-		lastSeen: time.Now(),
-	})
-
 	go proxy.Listen()
 	time.Sleep(100 * time.Millisecond)
 
 	proxyAddr := proxy.conns[0].LocalAddr().(*net.UDPAddr)
 
-	client, err := net.DialUDP("udp4", nil, proxyAddr)
+	clientAddr, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:12345")
+	client, err := net.DialUDP("udp4", clientAddr, proxyAddr)
 	if err != nil {
 		t.Fatalf("dial client: %v", err)
 	}
 	defer client.Close()
+	actualClientAddr := client.LocalAddr().(*net.UDPAddr)
+	proxy.clients.upsert(actualClientAddr, "test", "")
 
 	pkt := []byte{0xc0, 0, 0, 0, 1, 1, 0xaa, 1, 0xbb}
 	if _, err := client.Write(pkt); err != nil {
@@ -103,18 +99,8 @@ func TestBroadcast(t *testing.T) {
 	}
 	defer c2.Close()
 
-	proxy.clients.Store("a", &clientInfo{
-		addr:     c1.LocalAddr().(*net.UDPAddr),
-		domain:   "",
-		alpn:     "",
-		lastSeen: time.Now(),
-	})
-	proxy.clients.Store("b", &clientInfo{
-		addr:     c2.LocalAddr().(*net.UDPAddr),
-		domain:   "",
-		alpn:     "",
-		lastSeen: time.Now(),
-	})
+	proxy.clients.upsert(c1.LocalAddr().(*net.UDPAddr), "", "")
+	proxy.clients.upsert(c2.LocalAddr().(*net.UDPAddr), "", "")
 
 	msg := []byte("hi")
 	if _, err := upstream.WriteToUDP(msg, proxyAddr); err != nil {
@@ -146,23 +132,19 @@ func TestALPNPort(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	proxy.clients.Store("aa", &clientInfo{
-		addr:     &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
-		domain:   "test",
-		alpn:     "doq",
-		lastSeen: time.Now(),
-	})
-
 	go proxy.Listen()
 	time.Sleep(100 * time.Millisecond)
 
 	proxyAddr := proxy.conns[0].LocalAddr().(*net.UDPAddr)
 
-	client, err := net.DialUDP("udp4", nil, proxyAddr)
+	clientAddr, _ := net.ResolveUDPAddr("udp4", "127.0.0.1:12346")
+	client, err := net.DialUDP("udp4", clientAddr, proxyAddr)
 	if err != nil {
 		t.Fatalf("dial client: %v", err)
 	}
 	defer client.Close()
+	actualClientAddr := client.LocalAddr().(*net.UDPAddr)
+	proxy.clients.upsert(actualClientAddr, "test", "doq")
 
 	pkt := []byte{0xc0, 0, 0, 0, 1, 1, 0xaa, 1, 0xbb}
 	if _, err := client.Write(pkt); err != nil {

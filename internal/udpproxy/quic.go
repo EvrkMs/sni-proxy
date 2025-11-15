@@ -1,6 +1,7 @@
 package udpproxy
 
 import (
+	"encoding/hex"
 	"fmt"
 	"net"
 	"time"
@@ -133,9 +134,10 @@ func extractSNIFromQUICInitial(b []byte, logger *zap.Logger) (string, string, er
 	return "", "", fmt.Errorf("no CRYPTO frame found")
 }
 
-func (p *Proxy) sniffInitial(dcidHex string, addr *net.UDPAddr, data []byte) {
+func (p *Proxy) sniffInitial(dcid []byte, addr *net.UDPAddr, data []byte) {
 	p.unknownMu.Lock()
 	defer p.unknownMu.Unlock()
+	dcidHex := hex.EncodeToString(dcid)
 
 	for k, buf := range p.unknown {
 		if time.Since(buf.created) > p.cfg.SniffTTL {
@@ -169,9 +171,8 @@ func (p *Proxy) sniffInitial(dcidHex string, addr *net.UDPAddr, data []byte) {
 	p.log.Debug("[sniffInitial] trying extractSNIFromQUICInitial", zap.String("dcid", dcidHex), zap.Int("full_len", len(full)))
 
 	if sni, alpn, err := extractSNIFromQUICInitial(full, p.log); err == nil {
-		// ✅ Правка: работаем с нашим реестром клиентов (value-ориентированным)
 		p.clients.upsert(addr, sni, alpn)
-		p.clients.linkConnID(dcidHex, addr)
+		p.clients.linkConnID(dcid, addr, true)
 
 		p.log.Info("[sniffInitial] SNI/ALPN extracted", zap.String("dcid", dcidHex), zap.String("sni", sni), zap.String("alpn", alpn))
 		delete(p.unknown, dcidHex)
@@ -180,10 +181,14 @@ func (p *Proxy) sniffInitial(dcidHex string, addr *net.UDPAddr, data []byte) {
 	}
 }
 
-func isQUIC(b []byte) bool {
+func isQUICLongHeader(b []byte) bool {
 	return len(b) > 0 && (b[0]&0x80) == 0x80
 }
 
+func isQUICShortHeader(b []byte) bool {
+	return len(b) > 0 && (b[0]&0x80) == 0 && (b[0]&0x40) == 0x40
+}
+
 func isQUICInitial(b []byte) bool {
-	return isQUIC(b) && ((b[0]&0x30)>>4) == 0
+	return isQUICLongHeader(b) && ((b[0]&0x30)>>4) == 0
 }

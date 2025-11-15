@@ -158,20 +158,18 @@ func (p *TCPProxy) session(cli net.Conn) {
 	}
 
 	var up net.Conn
-	var sni string       // Store SNI for use in cp
-	var isWebSocket bool // Флаг, если это ws:// (HTTP Upgrade: websocket)
 
 	// --- TLS-ветка (wss://)
 	if len(b) >= 5 && b[0] == 0x16 && b[1] == 0x03 {
 		p.log.Debug("[TCP] detected TLS", zap.String("client", id))
-		sni, alpn, rawCH, err := readClientHello(r)
+		targetSNI, alpn, rawCH, err := readClientHello(r)
 		if err != nil {
 			p.log.Debug("[TCP] handshake fail", zap.String("client", id), zap.Error(err))
 			if tcpAddr, ok := cli.RemoteAddr().(*net.TCPAddr); ok {
 				last := p.resolver.GetLastKnownDomain(tcpAddr.IP.String())
 				if last != "" {
 					p.log.Info("[TCP] fallback domain", zap.String("client", id), zap.String("domain", last))
-					sni = last
+					targetSNI = last
 				} else {
 					setReason("handshake_fail")
 					return
@@ -181,14 +179,14 @@ func (p *TCPProxy) session(cli net.Conn) {
 				return
 			}
 		}
-		p.log.Info("[TCP] SNI", zap.String("client", id), zap.String("sni", sni), zap.String("alpn", alpn))
+		p.log.Info("[TCP] SNI", zap.String("client", id), zap.String("sni", targetSNI), zap.String("alpn", alpn))
 
 		if tcpAddr, ok := cli.RemoteAddr().(*net.TCPAddr); ok {
 			ipStr := tcpAddr.IP.String()
-			p.resolver.ForceHistory(ipStr, sni)
-			p.log.Debug("[TCP] history set", zap.String("ip", ipStr), zap.String("domain", sni))
+			p.resolver.ForceHistory(ipStr, targetSNI)
+			p.log.Debug("[TCP] history set", zap.String("ip", ipStr), zap.String("domain", targetSNI))
 		}
-		ips, err := p.resolver.LookupIPs(context.Background(), sni)
+		ips, err := p.resolver.LookupIPs(context.Background(), targetSNI)
 		if err != nil || len(ips) == 0 {
 			p.log.Debug("[TCP] DNS fail", zap.String("client", id), zap.Error(err))
 			setReason("dns_fail")
@@ -224,35 +222,12 @@ func (p *TCPProxy) session(cli net.Conn) {
 
 		// Определяем Host
 		host, ok := getHostFromHeaders(reqHeaders)
-
-		// Проверяем, есть ли Upgrade: websocket
-		for _, line := range reqHeaders {
-			low := strings.ToLower(line)
-			if strings.HasPrefix(low, "upgrade:") && strings.Contains(low, "websocket") {
-				isWebSocket = true
-				break
-			}
-		}
-
 		if !ok {
-			if tcpAddr, ok2 := cli.RemoteAddr().(*net.TCPAddr); ok2 {
-				last := p.resolver.GetLastKnownDomain(tcpAddr.IP.String())
-				if last != "" && isWebSocket {
-					p.log.Info("[TCP] fallback host", zap.String("client", id), zap.String("host", last))
-					host = last
-				} else {
-					p.log.Debug("[TCP] No Host header", zap.String("client", id))
-					setReason("no_host_header")
-					return
-				}
-			} else {
-				p.log.Debug("[TCP] No Host header", zap.String("client", id))
-				setReason("no_host_header")
-				return
-			}
+			p.log.Debug("[TCP] No Host header", zap.String("client", id))
+			setReason("no_host_header")
+			return
 		}
 
-		sni = host
 		p.log.Info("[TCP] Host", zap.String("client", id), zap.String("host", host))
 
 		if tcpAddr, ok := cli.RemoteAddr().(*net.TCPAddr); ok {
@@ -313,19 +288,13 @@ func (p *TCPProxy) session(cli net.Conn) {
 			return
 		}
 
-		if isWebSocket {
-			p.log.Info("[TCP] websocket handshake complete", zap.String("client", id), zap.String("host", sni))
-		}
 	}
 
 	// --- Теперь bidirectional data copy (TCP<->upstream)
 	resetDeadline := func() {
-		if isWebSocket {
+		if p.keepAlive <= 0 {
 			_ = cli.SetDeadline(time.Time{})
 			_ = up.SetDeadline(time.Time{})
-			return
-		}
-		if strings.HasSuffix(sni, ".discord.media") {
 			return
 		}
 		d := time.Now().Add(p.keepAlive)

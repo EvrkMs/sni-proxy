@@ -1,6 +1,7 @@
 package udpproxy
 
 import (
+	"bytes"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -28,7 +29,7 @@ func DefaultConfig() Config {
 		MaxSniffPkts: 8,
 		SniffTTL:     3 * time.Second,
 		DTLSTTL:      2 * time.Second,
-		ClientTTL:    10 * time.Minute,
+		ClientTTL:    0,
 		DoQPort:      8853,
 	}
 }
@@ -54,16 +55,23 @@ type clientInfo struct {
 	lastSeen time.Time
 }
 
+type connBinding struct {
+	addr     net.UDPAddr
+	addrKey  string
+	isClient bool
+	id       []byte
+}
+
 type clientRegistry struct {
 	mu     sync.RWMutex
 	byAddr map[string]clientInfo
-	byConn map[string]string
+	byConn map[string]connBinding
 }
 
 func newClientRegistry() *clientRegistry {
 	return &clientRegistry{
 		byAddr: make(map[string]clientInfo),
-		byConn: make(map[string]string),
+		byConn: make(map[string]connBinding),
 	}
 }
 
@@ -86,26 +94,77 @@ func (r *clientRegistry) upsert(addr *net.UDPAddr, domain, alpn string) {
 	r.mu.Unlock()
 }
 
-func (r *clientRegistry) linkConnID(id string, addr *net.UDPAddr) {
-	if id == "" || addr == nil {
+func (r *clientRegistry) linkConnID(id []byte, addr *net.UDPAddr, isClient bool) {
+	if len(id) == 0 || addr == nil {
 		return
 	}
 	r.upsert(addr, "", "")
+	key := hex.EncodeToString(id)
+	addrKey := addr.String()
+	addrCopy := cloneUDPAddrValue(addr)
 	r.mu.Lock()
-	r.byConn[id] = addr.String()
+	existing, ok := r.byConn[key]
+	if ok && existing.isClient != isClient {
+		r.mu.Unlock()
+		return
+	}
+	if !ok || len(existing.id) == 0 {
+		existing.id = append([]byte(nil), id...)
+	}
+	existing.addr = addrCopy
+	existing.addrKey = addrKey
+	existing.isClient = isClient
+	r.byConn[key] = existing
 	r.mu.Unlock()
 }
 
-func (r *clientRegistry) getByConnID(id string) (clientInfo, bool) {
+func (r *clientRegistry) getByConnIDHex(id string) (clientInfo, bool, bool) {
 	r.mu.RLock()
-	key, ok := r.byConn[id]
+	binding, ok := r.byConn[id]
 	if !ok {
 		r.mu.RUnlock()
-		return clientInfo{}, false
+		return clientInfo{}, false, false
 	}
-	info, ok := r.byAddr[key]
+	info, ok := r.byAddr[binding.addrKey]
 	r.mu.RUnlock()
-	return info, ok
+	return info, ok, binding.isClient
+}
+
+func (r *clientRegistry) getByConnIDBytes(id []byte) (clientInfo, bool, bool) {
+	if len(id) == 0 {
+		return clientInfo{}, false, false
+	}
+	return r.getByConnIDHex(hex.EncodeToString(id))
+}
+
+func (r *clientRegistry) matchByCIDPrefix(payload []byte) (clientInfo, bool, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var (
+		bestInfo     clientInfo
+		bestFound    bool
+		bestIsClient bool
+		bestLen      = -1
+	)
+	for _, binding := range r.byConn {
+		if len(binding.id) == 0 || len(payload) < len(binding.id) {
+			continue
+		}
+		if !bytes.Equal(binding.id, payload[:len(binding.id)]) {
+			continue
+		}
+		info, ok := r.byAddr[binding.addrKey]
+		if !ok {
+			continue
+		}
+		if len(binding.id) > bestLen {
+			bestInfo = info
+			bestFound = true
+			bestIsClient = binding.isClient
+			bestLen = len(binding.id)
+		}
+	}
+	return bestInfo, bestFound, bestIsClient
 }
 
 func (r *clientRegistry) getByAddr(addr *net.UDPAddr) (clientInfo, bool) {
@@ -144,6 +203,9 @@ func (r *clientRegistry) snapshot() []clientInfo {
 }
 
 func (r *clientRegistry) cleanup(ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
 	cutoff := time.Now().Add(-ttl)
 	r.mu.Lock()
 	for key, info := range r.byAddr {
@@ -151,8 +213,8 @@ func (r *clientRegistry) cleanup(ttl time.Duration) {
 			delete(r.byAddr, key)
 		}
 	}
-	for id, key := range r.byConn {
-		if info, ok := r.byAddr[key]; !ok || info.lastSeen.Before(cutoff) {
+	for id, binding := range r.byConn {
+		if info, ok := r.byAddr[binding.addrKey]; !ok || info.lastSeen.Before(cutoff) {
 			delete(r.byConn, id)
 		}
 	}
@@ -191,7 +253,7 @@ type Proxy struct {
 	dtlsMu     sync.Mutex
 	dtls       map[string]*dtlsBuf
 	clients    *clientRegistry
-	upstreamMu sync.Mutex
+	upstreamMu sync.RWMutex
 	upstream   map[string]upstreamInfo
 	bufPool    sync.Pool
 	quit       chan struct{}
@@ -265,11 +327,11 @@ func (p *Proxy) listenLoop(conn *net.UDPConn) {
 				continue
 			}
 			UDPActiveConnections.Inc()
-			go func(data []byte, addr *net.UDPAddr) {
+			go func(buf []byte, n int, addr *net.UDPAddr) {
 				defer UDPActiveConnections.Dec()
-				p.handlePacket(conn, addr, data[:n])
-				p.bufPool.Put(buf)
-			}(buf[:n], addr)
+				defer p.bufPool.Put(buf)
+				p.handlePacket(conn, addr, buf[:n])
+			}(buf, n, addr)
 		}
 	}
 }
@@ -362,6 +424,47 @@ func (p *Proxy) trackUpstream(addr *net.UDPAddr) {
 	p.upstreamMu.Unlock()
 }
 
+func (p *Proxy) isUpstreamAddr(addr *net.UDPAddr) bool {
+	if addr == nil {
+		return false
+	}
+	p.upstreamMu.RLock()
+	_, ok := p.upstream[addr.String()]
+	p.upstreamMu.RUnlock()
+	return ok
+}
+
+func (p *Proxy) routeByConnID(id []byte) *net.UDPAddr {
+	info, ok, ownerIsClient := p.clients.getByConnIDBytes(id)
+	if !ok {
+		return nil
+	}
+	dest := addrValueToPtr(info.addr)
+	if ownerIsClient {
+		p.clients.touch(dest)
+	} else {
+		p.trackUpstream(dest)
+	}
+	return dest
+}
+
+func (p *Proxy) routeShortHeader(payload []byte) *net.UDPAddr {
+	if len(payload) == 0 {
+		return nil
+	}
+	info, ok, ownerIsClient := p.clients.matchByCIDPrefix(payload)
+	if !ok {
+		return nil
+	}
+	dest := addrValueToPtr(info.addr)
+	if ownerIsClient {
+		p.clients.touch(dest)
+	} else {
+		p.trackUpstream(dest)
+	}
+	return dest
+}
+
 func (p *Proxy) cleanupLoop() {
 	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
@@ -371,7 +474,9 @@ func (p *Proxy) cleanupLoop() {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			p.clients.cleanup(p.cfg.ClientTTL)
+			if p.cfg.ClientTTL > 0 {
+				p.clients.cleanup(p.cfg.ClientTTL)
+			}
 			p.unknownMu.Lock()
 			for key, buf := range p.unknown {
 				if now.Sub(buf.created) > p.cfg.SniffTTL {
@@ -386,13 +491,15 @@ func (p *Proxy) cleanupLoop() {
 				}
 			}
 			p.dtlsMu.Unlock()
-			p.upstreamMu.Lock()
-			for addr, up := range p.upstream {
-				if now.Sub(up.lastSeen) > p.cfg.ClientTTL {
-					delete(p.upstream, addr)
+			if p.cfg.ClientTTL > 0 {
+				p.upstreamMu.Lock()
+				for addr, up := range p.upstream {
+					if now.Sub(up.lastSeen) > p.cfg.ClientTTL {
+						delete(p.upstream, addr)
+					}
 				}
+				p.upstreamMu.Unlock()
 			}
-			p.upstreamMu.Unlock()
 		}
 	}
 }
@@ -405,86 +512,65 @@ func portFromALPN(alpn string) int {
 }
 
 func (p *Proxy) determineDestination(addr *net.UDPAddr, data []byte) *net.UDPAddr {
-	if isQUIC(data) {
+	fromClient := !p.isUpstreamAddr(addr)
+	if fromClient {
+		p.clients.touch(addr)
+	} else {
+		p.trackUpstream(addr)
+	}
+
+	if isQUICLongHeader(data) {
 		dcid, scid, err := extractConnectionIDs(data, p.log)
 		if err == nil && (len(dcid) > 0 || len(scid) > 0) {
-			dcidHex := hex.EncodeToString(dcid)
-			scidHex := hex.EncodeToString(scid)
-
-			infoD, okD := p.clients.getByConnID(dcidHex)
-			infoS, okS := p.clients.getByConnID(scidHex)
-
-			fromClient := false
-			if okD && addr.IP.Equal(infoD.addr.IP) && addr.Port == infoD.addr.Port {
-				fromClient = true
-				p.clients.touch(addr)
+			if dest := p.routeByConnID(dcid); dest != nil {
+				return dest
 			}
-			if okS && addr.IP.Equal(infoS.addr.IP) && addr.Port == infoS.addr.Port {
-				fromClient = true
-				p.clients.touch(addr)
+			if len(scid) > 0 {
+				p.clients.linkConnID(scid, addr, fromClient)
+			}
+			if fromClient && len(dcid) > 0 {
+				p.clients.linkConnID(dcid, addr, true)
 			}
 
-			if !fromClient {
-				p.trackUpstream(addr)
-				switch {
-				case okD:
-					return addrValueToPtr(infoD.addr)
-				case okS:
-					return addrValueToPtr(infoS.addr)
-				}
+			if isQUICInitial(data) && fromClient && len(dcid) > 0 {
+				p.sniffInitial(dcid, addr, data)
 			}
 
-			if isQUICInitial(data) {
-				if dcidHex != "" {
-					p.clients.linkConnID(dcidHex, addr)
-				}
-				if scidHex != "" {
-					p.clients.linkConnID(scidHex, addr)
-				}
-				if dcidHex != "" {
-					p.sniffInitial(dcidHex, addr, data)
-				}
-				if dcidHex != "" && scidHex != "" {
-					if info, ok := p.clients.getByConnID(dcidHex); ok && info.domain != "" {
-						p.clients.linkConnID(scidHex, addr)
-					}
-				}
-			}
-
-			domain := ""
-			alpn := ""
-			if dcidHex != "" {
-				if info, ok := p.clients.getByConnID(dcidHex); ok {
+			if fromClient {
+				domain := ""
+				alpn := ""
+				if info, ok, ownerIsClient := p.clients.getByConnIDBytes(dcid); ok && ownerIsClient {
 					domain = info.domain
 					alpn = info.alpn
 				}
-			}
-			if domain == "" && scidHex != "" {
-				if info, ok := p.clients.getByConnID(scidHex); ok {
-					domain = info.domain
-					if alpn == "" {
-						alpn = info.alpn
-					}
-				}
-			}
-
-			if domain != "" {
-				if upIP, err := p.resolver.LookupCachedIP(domain); err == nil && upIP != nil {
-					port := portFromALPN(alpn)
-					if port == 443 && scidHex != "" {
-						if info, ok := p.clients.getByConnID(scidHex); ok {
-							port = portFromALPN(info.alpn)
+				if domain == "" {
+					if info, ok, ownerIsClient := p.clients.getByConnIDBytes(scid); ok && ownerIsClient {
+						domain = info.domain
+						if alpn == "" {
+							alpn = info.alpn
 						}
 					}
-					upAddr := &net.UDPAddr{IP: upIP, Port: port}
-					p.trackUpstream(upAddr)
-					return upAddr
+				}
+
+				if domain != "" {
+					if upIP, err := p.resolver.LookupCachedIP(domain); err == nil && upIP != nil {
+						port := portFromALPN(alpn)
+						upAddr := &net.UDPAddr{IP: upIP, Port: port}
+						p.trackUpstream(upAddr)
+						return upAddr
+					}
 				}
 			}
 		}
 	}
 
-	if isDTLSClientHello(data) {
+	if isQUICShortHeader(data) {
+		if dest := p.routeShortHeader(data[1:]); dest != nil {
+			return dest
+		}
+	}
+
+	if isDTLSClientHello(data) && fromClient {
 		if sni, ok := p.feedDTLS(addr, data); ok {
 			p.clients.upsert(addr, sni, "")
 			if upIP, err := p.resolver.LookupCachedIP(sni); err == nil && upIP != nil {
@@ -496,22 +582,6 @@ func (p *Proxy) determineDestination(addr *net.UDPAddr, data []byte) *net.UDPAdd
 				p.trackUpstream(upAddr)
 				return upAddr
 			}
-		}
-	}
-
-	last := p.resolver.GetLastKnownDomain(addr.IP.String())
-	if last == "discord.com" {
-		last = "gateway.discord.gg"
-	}
-	if last != "" {
-		if upIP, err := p.resolver.LookupCachedIP(last); err == nil && upIP != nil {
-			port := 443
-			if info, ok := p.clients.getByAddr(addr); ok {
-				port = portFromALPN(info.alpn)
-			}
-			upAddr := &net.UDPAddr{IP: upIP, Port: port}
-			p.trackUpstream(upAddr)
-			return upAddr
 		}
 	}
 
