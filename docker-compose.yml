@@ -1,0 +1,49 @@
+name: sni-proxy
+
+services:
+  sni-proxy:
+    build: .
+    container_name: sni-proxy
+    restart: unless-stopped
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: udp
+        mode: host
+    networks:
+      tg-socks:
+    environment:
+      # TCP port for TLS traffic (SNI-based routing)
+      - LISTEN_HTTPS=0.0.0.0:443
+
+      - SOCKS_URL=socks5://tg-socks:1080
+      # TCP port for plain HTTP traffic (Host-header-based routing)
+      - LISTEN_HTTP=0.0.0.0:80
+
+      # DNS-over-HTTPS resolver (Cloudflare; swap for Google: https://8.8.8.8/dns-query)
+      - DOH_SERVER=https://8.8.8.8/dns-query
+
+    # Required to bind to privileged ports 80 and 443 as a non-root process
+    cap_add:
+      - NET_BIND_SERVICE
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  tg-socks:
+    external: true
