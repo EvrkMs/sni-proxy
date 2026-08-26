@@ -16,8 +16,9 @@ import (
 const udpReadBuf = 2048
 
 type Server struct {
-	config config.Config
-	tunnel *proxy.Tunnel
+	config    config.Config
+	tunnel    *proxy.Tunnel
+	udpTunnel *proxy.UDPTunnel // nil => only QUIC rejector
 }
 
 func New(cfg config.Config, tunnel *proxy.Tunnel) *Server {
@@ -25,6 +26,12 @@ func New(cfg config.Config, tunnel *proxy.Tunnel) *Server {
 		config: cfg,
 		tunnel: tunnel,
 	}
+}
+
+// SetUDPTunnel enables QUIC/UDP proxying through SOCKS when the upstream
+// supports UDP ASSOCIATE. If nil, the server falls back to Version Negotiation.
+func (s *Server) SetUDPTunnel(u *proxy.UDPTunnel) {
+	s.udpTunnel = u
 }
 
 func (s *Server) StartAll() ([]net.Listener, error) {
@@ -147,44 +154,49 @@ func (s *Server) handleConn(conn net.Conn, defaultPort string) {
 // readFullTLSRecord is a compile-time reminder that the logic above must stay in sync.
 var _ = binary.BigEndian
 
-// StartUDPQuicRejector binds a UDP socket on addr and responds to every
-// QUIC Initial packet with a Version Negotiation packet that lists no
-// supported versions.  This causes all QUIC/HTTP3 clients to immediately
-// fall back to TCP/TLS without waiting for a timeout.
-//
-// Non-QUIC UDP datagrams are silently dropped.
-// Returns the bound PacketConn; caller must close it on shutdown.
-func (s *Server) StartUDPQuicRejector(addr string) (net.PacketConn, error) {
+// StartUDP starts the UDP handler on addr.
+// If a UDPTunnel was set (SOCKS supports UDP), QUIC is proxied through SOCKS.
+// Otherwise every QUIC Initial gets a Version Negotiation reply (TCP fallback).
+func (s *Server) StartUDP(addr string) (net.PacketConn, error) {
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("cannot listen UDP on %s: %w", addr, err)
 	}
 
+	if s.udpTunnel != nil {
+		log.Printf("[info] QUIC/UDP proxy ready on UDP %s (via SOCKS UDP ASSOCIATE)", addr)
+		go s.udpTunnel.Serve(conn)
+		return conn, nil
+	}
+
 	log.Printf("[info] QUIC rejector ready on UDP %s", addr)
-
-	go func() {
-		buf := make([]byte, udpReadBuf)
-		for {
-			n, src, err := conn.ReadFrom(buf)
-			if err != nil {
-				// closed externally
-				break
-			}
-
-			pkt := buf[:n]
-			hdr, err := sniff.ParseQUICLongHeader(pkt)
-			if err != nil {
-				// Not a QUIC long-header packet (Short Header, stray UDP, etc.) — drop.
-				continue
-			}
-
-			vn := sniff.BuildVersionNegotiation(hdr)
-			if _, err := conn.WriteTo(vn, src); err != nil {
-				log.Printf("[warn] QUIC VN write to %s: %v", src, err)
-			}
-		}
-		log.Printf("[info] QUIC rejector stopped")
-	}()
-
+	go s.runQuicRejector(conn)
 	return conn, nil
+}
+
+// StartUDPQuicRejector is kept for compatibility; prefer StartUDP.
+func (s *Server) StartUDPQuicRejector(addr string) (net.PacketConn, error) {
+	return s.StartUDP(addr)
+}
+
+func (s *Server) runQuicRejector(conn net.PacketConn) {
+	buf := make([]byte, udpReadBuf)
+	for {
+		n, src, err := conn.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+
+		pkt := buf[:n]
+		hdr, err := sniff.ParseQUICLongHeader(pkt)
+		if err != nil {
+			continue
+		}
+
+		vn := sniff.BuildVersionNegotiation(hdr)
+		if _, err := conn.WriteTo(vn, src); err != nil {
+			log.Printf("[warn] QUIC VN write to %s: %v", src, err)
+		}
+	}
+	log.Printf("[info] QUIC rejector stopped")
 }
