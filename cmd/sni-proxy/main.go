@@ -34,6 +34,13 @@ func main() {
 		log.Fatalf("[fatal] socks dialer: %v", err)
 	}
 
+	// Probe SOCKS5 for UDP ASSOCIATE support (result is cached).
+	if socksDialer.SupportsUDP() {
+		log.Printf("[info] SOCKS upstream supports UDP — ListenPacket() available")
+	} else {
+		log.Printf("[info] SOCKS upstream has no UDP (QUIC will keep falling back to TCP)")
+	}
+
 	dialer := upstream.NewSwappableDialer(socksDialer)
 
 	res := resolver.NewDoHResolver(cfg.DoHServer, cfg.CacheTTL)
@@ -47,6 +54,9 @@ func main() {
 
 	// Bind UDP on the same address as HTTPS to intercept QUIC/HTTP3 and
 	// send back Version Negotiation — clients immediately fall back to TCP/TLS.
+	// Full QUIC proxying via SOCKS UDP ASSOCIATE is possible when SupportsUDP()
+	// is true, but still requires SNI extraction from the Initial packet;
+	// for now we keep the rejector so clients fall back cleanly.
 	udpConn, err := srv.StartUDPQuicRejector(cfg.ListenHTTPS)
 	if err != nil {
 		log.Printf("[warn] QUIC rejector: %v (UDP 443 will not be handled)", err)
