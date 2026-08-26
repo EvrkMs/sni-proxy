@@ -18,7 +18,7 @@ func Load() Config {
 		ListenHTTPS: envOr("LISTEN_HTTPS", "0.0.0.0:443"),
 		ListenHTTP:  envOr("LISTEN_HTTP", "0.0.0.0:80"),
 		SocksURL:    envOr("SOCKS_URL", ""),
-		DoHServer:   envOr("DOH_SERVER", "https://a353d38e:%7E4UzAyVk@d.adguard-dns.com/dns-query"),
+		DoHServer:   envOr("DOH_SERVER", "https://cloudflare-dns.com/dns-query"),
 		CacheTTL:    durationOr("DNS_CACHE_TTL", 5*time.Minute),
 	}
 }
