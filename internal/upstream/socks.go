@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,22 +86,61 @@ func (d *SocksDialer) Dial(network, address string) (net.Conn, error) {
 	return d.d.Dial(network, address)
 }
 
-// SupportsUDP probes the SOCKS5 server once (UDP ASSOCIATE) and caches the result.
+// SupportsUDP probes the SOCKS5 server for UDP ASSOCIATE and caches the result.
+// On transient network errors (e.g. "no route to host" right after container start
+// on MikroTik) the probe is retried several times before giving up.
 // Safe for concurrent use.
 func (d *SocksDialer) SupportsUDP() bool {
 	d.udpOnce.Do(func() {
-		pc, err := d.ListenPacket()
-		if err != nil {
-			d.udpProbeErr = err
-			d.udpOK = false
-			log.Printf("[info] SOCKS UDP ASSOCIATE probe failed: %v (UDP unavailable)", err)
-			return
+		const attempts = 8
+		var lastErr error
+		for i := 1; i <= attempts; i++ {
+			pc, err := d.ListenPacket()
+			if err == nil {
+				_ = pc.Close()
+				d.udpOK = true
+				d.udpProbeErr = nil
+				log.Printf("[info] SOCKS UDP ASSOCIATE OK — UDP is available")
+				return
+			}
+			lastErr = err
+			// Retry only likely-transient dial/route errors; permanent SOCKS
+			// rejections (REP != 0) are not worth spinning on.
+			if !isTransientNetErr(err) {
+				break
+			}
+			backoff := time.Duration(i) * 500 * time.Millisecond
+			log.Printf("[info] SOCKS UDP probe attempt %d/%d failed: %v — retry in %s",
+				i, attempts, err, backoff)
+			time.Sleep(backoff)
 		}
-		_ = pc.Close()
-		d.udpOK = true
-		log.Printf("[info] SOCKS UDP ASSOCIATE OK — UDP is available")
+		d.udpProbeErr = lastErr
+		d.udpOK = false
+		log.Printf("[info] SOCKS UDP ASSOCIATE probe failed: %v (UDP unavailable)", lastErr)
 	})
 	return d.udpOK
+}
+
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{
+		"no route to host",
+		"network is unreachable",
+		"connection refused",
+		"i/o timeout",
+		"timed out",
+		"temporary failure",
+		"host is down",
+		"connection reset",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // UDPProbeError returns the error from the last UDP probe (if any).
@@ -156,6 +196,32 @@ func (d *SocksDialer) ListenPacket() (net.PacketConn, error) {
 }
 
 // ---------- SOCKS5 wire helpers ----------
+
+
+func socksRepString(rep byte) string {
+	switch rep {
+	case 0x00:
+		return "succeeded"
+	case 0x01:
+		return "general failure"
+	case 0x02:
+		return "not allowed by ruleset"
+	case 0x03:
+		return "network unreachable"
+	case 0x04:
+		return "host unreachable"
+	case 0x05:
+		return "connection refused"
+	case 0x06:
+		return "TTL expired"
+	case 0x07:
+		return "command not supported (UDP likely disabled on SOCKS inbound)"
+	case 0x08:
+		return "address type not supported"
+	default:
+		return fmt.Sprintf("unknown REP %d", rep)
+	}
+}
 
 func socks5Handshake(conn net.Conn, user, password string) error {
 	var methods []byte
@@ -230,7 +296,7 @@ func socks5UDPAssociate(conn net.Conn) (*net.UDPAddr, error) {
 		return nil, fmt.Errorf("bad version %d", hdr[0])
 	}
 	if hdr[1] != 0x00 {
-		return nil, fmt.Errorf("UDP ASSOCIATE rejected (REP=%d)", hdr[1])
+		return nil, fmt.Errorf("UDP ASSOCIATE rejected: %s (REP=%d)", socksRepString(hdr[1]), hdr[1])
 	}
 
 	var host string
